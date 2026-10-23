@@ -2,47 +2,108 @@ package protocol
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 )
 
 const MaxMessageSize = 10 * 1024 * 1024
+const MaxMetadataSize = 1 * 1024 * 1024
+const MaxBodySize = 10 * 1024 * 1024
 
-func WriteMessage(w io.Writer, data []byte) error {
-	if len(data) > MaxMessageSize {
-		return fmt.Errorf("message too large %d bytes", len(data))
+type Metadata struct {
+	ID       string      `json:"id"`
+	Type     string      `json:"type"`
+	Method   string      `json:"method"`
+	Path     string      `json:"path"`
+	RawQuery string      `json:"rawQuery,omitempty"`
+	StatusCode int `json:"statusCode,omitempty"`
+	Headers  http.Header `json:"headers"`
+}
+
+/**
+*
+┌─────────────────────────┐
+│ 4 bytes: metadata length│
+├─────────────────────────┤
+│ N bytes: JSON metadata  │
+├─────────────────────────┤
+│ 4 bytes: body length    │
+├─────────────────────────┤
+│ N bytes: raw body bytes │
+└─────────────────────────┘
+*/
+
+func WriteMessage(conn net.Conn, meta Metadata, body io.Reader, bodyLength uint32) error {
+
+	metadata, err := json.Marshal(meta)
+	if err != nil {
+		return err
 	}
+	if len(metadata) > MaxMetadataSize || bodyLength > MaxBodySize {
+		return fmt.Errorf("messsage exceeds size limit")
+	}
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(metadata)))
 
-	var header [4]byte
-
-	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
-
-	if err := writeAll(w, header[:]); err != nil {
+	if err := writeAll(conn, length[:]); err != nil {
 		return err
 	}
 
-	return writeAll(w, data[:])
+	if err := writeAll(conn, metadata); err != nil {
+		return err
+	}
+
+	binary.BigEndian.PutUint32(length[:], bodyLength)
+
+	if err := writeAll(conn, length[:]); err != nil {
+		return err
+	}
+
+	_, err = io.CopyN(conn, body, int64(bodyLength))
+
+	return err
 }
 
-func ReadMessage(r io.Reader) ([]byte, error) {
-	var header [4]byte
+func ReadMessage(conn net.Conn) (Metadata, []byte, error) {
+	var length [4]byte
+	var meta Metadata
 
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(conn, length[:]); err != nil {
+		return meta, nil, err
 	}
 
-	size := binary.BigEndian.Uint32(header[:])
+	metaLen := binary.BigEndian.Uint32(length[:])
 
-	if size > MaxMessageSize {
-		return nil, fmt.Errorf("message  too large: %d bytes", size)
+	if metaLen > MaxMetadataSize {
+		return meta, nil, fmt.Errorf("metadata too large")
 	}
 
-	data := make([]byte, int(size))
-	if _, err := io.ReadFull(r, data); err != nil {
-		return nil, err
+	metadata := make([]byte, metaLen)
+	if _, err := io.ReadFull(conn, metadata); err != nil {
+		return meta, nil, err
 	}
 
-	return data, nil
+	if err := json.Unmarshal(metadata, &meta); err != nil {
+		return meta, nil, err
+	}
+
+	if _, err := io.ReadFull(conn, length[:]); err != nil {
+		return meta, nil, err
+	}
+
+	bodyLen := binary.BigEndian.Uint32(length[:])
+
+	if bodyLen > MaxBodySize {
+		return meta, nil, fmt.Errorf("body too large")
+	}
+
+	body := make([]byte, bodyLen)
+	_, err := io.ReadFull(conn, body)
+	
+	return meta, body, err
 }
 
 func writeAll(w io.Writer, data []byte) error {

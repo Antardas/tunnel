@@ -4,7 +4,9 @@ import (
 	"antardas/tcp-tunnel/protocol"
 	"bytes"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 )
 
 func Connect() {
@@ -19,20 +21,62 @@ func Connect() {
 	defer conn.Close()
 
 	fmt.Println("Conneted to the server")
-	for i := 0; i < 3; i++ {
 
-		// _, err = conn.Write(fmt.Appendf(nil, "Hello from Go client! i = %d\n", i))
-		data := bytes.Repeat([]byte("A"), (1024 * 1024 * 10))
+	for {
 
-		if err := protocol.WriteMessage(conn, data); err != nil {
-			panic(err)
-		}
+		meta, body, err := protocol.ReadMessage(conn)
 
-		response, err := protocol.ReadMessage(conn)
 		if err != nil {
-			panic(err)
+			fmt.Println("Tunnel Connetion Closed: ", err)
+			return
 		}
-		fmt.Println("Sent:", len(data), "Received:", len(response))
+
+		if meta.Type != "request" {
+			fmt.Println("Unexpected message type:", meta.Type)
+			continue
+		}
+
+		if err := callService(conn, meta, body); err != nil {
+			fmt.Println("Service request failed: ", err)
+			return
+		}
+
+	}
+}
+
+func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
+	// here this URL from server TCP metadata
+	path := "http://localhost:4050" + meta.Path
+	if meta.RawQuery != "" {
+		path += "?" + meta.RawQuery
+	}
+	fmt.Printf("Path: %s\n", path)
+	req, err := http.NewRequest(meta.Method, path, bytes.NewReader(rawBody))
+	if err != nil {
+		return err
+	}
+	req.Header = meta.Headers.Clone()
+	client := &http.Client{}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+
+	if err != nil {
+		return err
 	}
 
+	fmt.Printf("Status: %d\n", resp.StatusCode)
+	fmt.Printf("Body: %s\n", body)
+	responseMeta := protocol.Metadata{
+		ID:         meta.ID,
+		Type:       "response",
+		StatusCode: resp.StatusCode,
+		Headers:    resp.Header,
+	}
+
+	return protocol.WriteMessage(conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
 }

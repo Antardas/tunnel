@@ -2,13 +2,24 @@ package server
 
 import (
 	"antardas/tcp-tunnel/protocol"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"sync"
+
+	"github.com/google/uuid"
+)
+
+var (
+	tunnelConn net.Conn
+	tunnelMu   sync.Mutex
 )
 
 func Start() {
 	listener, err := net.Listen("tcp", ":8080")
+	go startHTTPServer()
 
 	if err != nil {
 		panic(err)
@@ -25,35 +36,89 @@ func Start() {
 			fmt.Println("Accept error", err)
 			continue
 		}
+		tunnelMu.Lock()
+		if tunnelConn != nil {
+			_ = tunnelConn.Close()
+		}
 
-		go handleConnection(conn)
-
+		tunnelConn = conn
+		tunnelMu.Unlock()
+		fmt.Println("Tunnel client connected")
 	}
 
 }
 
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
+func startHTTPServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleHTTP)
+	fmt.Println("HTTP server listen on :5136")
 
-	for {
+	if err := http.ListenAndServe(":5136", mux); err != nil {
+		fmt.Println("HTTP server error: ", err)
+	}
+}
 
-		response, err := protocol.ReadMessage(conn)
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("Client disconnected")
-			} else {
-				fmt.Println("Read Error: ", err)
-			}
+func handleHTTP(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Received: ", r.Method, r.URL.Path)
 
-			return
-		}
+	tunnelMu.Lock()
+	defer tunnelMu.Unlock()
 
-		fmt.Println("Client Sent: ", string(response))
+	if tunnelConn == nil {
+		http.Error(w, "Tunnel client not connected", http.StatusServiceUnavailable)
+		return
+	}
 
-		if err := protocol.WriteMessage(conn, response); err != nil {
-			fmt.Println("Write Error: ", err)
-			return
+	body, err := io.ReadAll(r.Body)
+
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	meta := protocol.Metadata{
+		ID:       uuid.NewString(),
+		Type:     "request",
+		Method:   r.Method,
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+		Headers:  r.Header,
+	}
+
+	if err := protocol.WriteMessage(tunnelConn, meta, bytes.NewReader(body), uint32(len(body))); err != nil {
+		_ = tunnelConn.Close()
+		tunnelConn = nil
+		http.Error(w, "Failed to send request to tunnel", http.StatusBadGateway)
+		return
+	}
+
+	responseMeta, responseBody, err := protocol.ReadMessage(tunnelConn)
+
+	if err != nil {
+		_ = tunnelConn.Close()
+		tunnelConn = nil
+		http.Error(w, "Failed to receive tunnel response", http.StatusBadGateway)
+		return
+	}
+
+	if meta.ID != responseMeta.ID {
+		http.Error(w, "Tunnel response mismatch", http.StatusBadGateway)
+		return
+	}
+
+	for key, values := range responseMeta.Headers {
+		for _, value := range values {
+			w.Header().Add(key, value)
 		}
 	}
+
+	status := responseMeta.StatusCode
+
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+
+	w.WriteHeader(status)
+	_, _ = w.Write(responseBody)
 
 }
