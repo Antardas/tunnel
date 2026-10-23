@@ -7,15 +7,27 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 )
 
 func Connect() {
+	for {
+		err := connectOnce()
+		if err != nil {
+			fmt.Println("Tunnel Disconnected: ", err)
+		}
+		fmt.Println("Reconnecting in 2 seconds...")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func connectOnce() error {
 	fmt.Println("Connecting to the public server")
 
-	conn, err := net.Dial("tcp", "localhost:8080")
+	conn, err := net.DialTimeout("tcp", "localhost:8080", 5*time.Second)
 
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	defer conn.Close()
@@ -27,8 +39,8 @@ func Connect() {
 		meta, body, err := protocol.ReadMessage(conn)
 
 		if err != nil {
-			fmt.Println("Tunnel Connetion Closed: ", err)
-			return
+			return err
+
 		}
 
 		if meta.Type != "request" {
@@ -37,8 +49,7 @@ func Connect() {
 		}
 
 		if err := callService(conn, meta, body); err != nil {
-			fmt.Println("Service request failed: ", err)
-			return
+			return err
 		}
 
 	}
