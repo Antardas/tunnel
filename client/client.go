@@ -3,16 +3,21 @@ package client
 import (
 	"antardas/tcp-tunnel/protocol"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-func Connect() {
+var activeClientId string
+
+func Connect(clientId string) {
 	for {
-		err := connectOnce()
+		err := connectOnce(clientId)
 		if err != nil {
 			fmt.Println("Tunnel Disconnected: ", err)
 		}
@@ -21,26 +26,33 @@ func Connect() {
 	}
 }
 
-func connectOnce() error {
+func connectOnce(clientId string) error {
 	fmt.Println("Connecting to the public server")
 
-	conn, err := net.DialTimeout("tcp", "localhost:8080", 5*time.Second)
+	conn, err := net.DialTimeout("tcp", "tunnel.oshudstock.com:5135", 5*time.Second)
 
 	if err != nil {
 		return err
 	}
 
 	defer conn.Close()
-
+	meta := protocol.Metadata{
+		ID:       uuid.NewString(),
+		ClientId: clientId,
+		Type:     "init",
+		Path:     "",
+		Method:   "",
+	}
+	protocol.WriteMessage(conn, meta, bytes.NewReader([]byte("")), 0)
 	fmt.Println("Conneted to the server")
+	activeClientId = clientId
 
 	for {
 
 		meta, body, err := protocol.ReadMessage(conn)
-
 		if err != nil {
-			return err
-
+			fmt.Println("Reading Request failed:", err)
+			continue
 		}
 
 		if meta.Type != "request" {
@@ -49,7 +61,8 @@ func connectOnce() error {
 		}
 
 		if err := callService(conn, meta, body); err != nil {
-			return err
+			fmt.Println("Reading Request failed:", err)
+			continue
 		}
 
 	}
@@ -57,13 +70,20 @@ func connectOnce() error {
 
 func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
 	// here this URL from server TCP metadata
-	path := "http://localhost:4050" + meta.Path
+	if meta.ClientHost == "" {
+		return errors.New("clientHost is required")
+	}
+	if meta.ClientPort == "" {
+		return errors.New("clientPort is required")
+	}
+	path := fmt.Sprintf("http://localhost:%s", meta.ClientPort) + meta.Path
 	if meta.RawQuery != "" {
 		path += "?" + meta.RawQuery
 	}
 	fmt.Printf("Path: %s\n", path)
 	req, err := http.NewRequest(meta.Method, path, bytes.NewReader(rawBody))
 	if err != nil {
+		fmt.Println("Error happend during calling local service")
 		return err
 	}
 	req.Header = meta.Headers.Clone()
@@ -81,9 +101,10 @@ func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
 	}
 
 	fmt.Printf("Status: %d\n", resp.StatusCode)
-	fmt.Printf("Body: %s\n", body)
+	fmt.Printf("Body: %d\n", len(body))
 	responseMeta := protocol.Metadata{
 		ID:         meta.ID,
+		ClientId:   activeClientId,
 		Type:       "response",
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header,

@@ -13,12 +13,29 @@ import (
 )
 
 var (
-	tunnelConn net.Conn
-	tunnelMu   sync.Mutex
+	tunnelConn  = make(map[string]net.Conn)
+	ClientHosts = map[string][]string{
+		"1": {"port-5000.dev.oshudstock.com", "port-4000.dev.oshudstock.com"},
+		"2": {"port-5147.dev.oshudstock.com", "port-7000.dev.oshudstock.com"},
+	}
+	HostClient = map[string]string{
+		"port-5000.dev.oshudstock.com": "1",
+		"port-4000.dev.oshudstock.com": "1",
+		"port-5147.dev.oshudstock.com": "2",
+		"port-7000.dev.oshudstock.com": "2",
+	}
+
+	HostPort = map[string]string{
+		"port-5000.dev.oshudstock.com": "5000",
+		"port-4000.dev.oshudstock.com": "4000",
+		"port-5147.dev.oshudstock.com": "5147",
+		"port-7000.dev.oshudstock.com": "7000",
+	}
+	tunnelMu sync.Mutex
 )
 
 func Start() {
-	listener, err := net.Listen("tcp", ":8080")
+	listener, err := net.Listen("tcp", ":5135")
 	go startHTTPServer()
 
 	if err != nil {
@@ -27,7 +44,7 @@ func Start() {
 
 	defer listener.Close()
 
-	fmt.Println("Server is listening 8080")
+	fmt.Println("Server is listening 5135")
 
 	for {
 		conn, err := listener.Accept()
@@ -36,14 +53,22 @@ func Start() {
 			fmt.Println("Accept error", err)
 			continue
 		}
-		tunnelMu.Lock()
-		if tunnelConn != nil {
-			_ = tunnelConn.Close()
+		meta, _, err := protocol.ReadMessage(conn)
+		if err != nil {
+			fmt.Println("Error reading message from client:")
+			conn.Close()
+			continue
 		}
-
-		tunnelConn = conn
+		if meta.ClientId == "" {
+			fmt.Println("Rejected: ClientId is required")
+			continue
+		}
+		tunnelMu.Lock()
+		if meta.Type == "init" {
+			tunnelConn[meta.ClientId] = conn
+		}
 		tunnelMu.Unlock()
-		fmt.Println("Tunnel client connected")
+		fmt.Println("Tunnel client connected: ", meta.ClientId)
 	}
 
 }
@@ -59,15 +84,30 @@ func startHTTPServer() {
 }
 
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Received: ", r.Method, r.URL.Path)
+	host := r.Host
+	fmt.Println("Received: ", r.Method, r.URL.Path, r.URL.Port())
 
-	tunnelMu.Lock()
-	defer tunnelMu.Unlock()
+	hostname, _, err := net.SplitHostPort(host)
 
-	if tunnelConn == nil {
-		http.Error(w, "Tunnel client not connected", http.StatusServiceUnavailable)
+	if err == nil {
+		host = hostname
+	}
+
+	clientId, ok := HostClient[host]
+	if !ok {
+		http.Error(w, "Unknowd host", http.StatusNotFound)
 		return
 	}
+
+	hostPort, ok := HostPort[host]
+	if !ok {
+		http.Error(w, "Port not configured", http.StatusNotFound)
+		return
+	}
+
+	fmt.Println("Host: ", host)
+	fmt.Println("Client ID: ", clientId)
+	fmt.Println("Local Port", hostPort)
 
 	body, err := io.ReadAll(r.Body)
 
@@ -77,26 +117,32 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	meta := protocol.Metadata{
-		ID:       uuid.NewString(),
-		Type:     "request",
-		Method:   r.Method,
-		Path:     r.URL.Path,
-		RawQuery: r.URL.RawQuery,
-		Headers:  r.Header,
+		ID:         uuid.NewString(),
+		Type:       "request",
+		ClientHost: host,
+		ClientPort: hostPort,
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		RawQuery:   r.URL.RawQuery,
+		Headers:    r.Header,
 	}
-
-	if err := protocol.WriteMessage(tunnelConn, meta, bytes.NewReader(body), uint32(len(body))); err != nil {
-		_ = tunnelConn.Close()
-		tunnelConn = nil
+	tunnelMu.Lock()
+	tunnelConnClient, ok := tunnelConn[clientId]
+	tunnelMu.Unlock()
+	if !ok {
+		http.Error(w, "Client not establieshed connection", http.StatusBadGateway)
+		return
+	}
+	if err := protocol.WriteMessage(tunnelConnClient, meta, bytes.NewReader(body), uint32(len(body))); err != nil {
+		_ = tunnelConnClient.Close()
 		http.Error(w, "Failed to send request to tunnel", http.StatusBadGateway)
 		return
 	}
 
-	responseMeta, responseBody, err := protocol.ReadMessage(tunnelConn)
+	responseMeta, responseBody, err := protocol.ReadMessage(tunnelConnClient)
 
 	if err != nil {
-		_ = tunnelConn.Close()
-		tunnelConn = nil
+		_ = tunnelConnClient.Close()
 		http.Error(w, "Failed to receive tunnel response", http.StatusBadGateway)
 		return
 	}

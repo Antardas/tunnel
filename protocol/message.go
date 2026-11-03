@@ -14,13 +14,16 @@ const MaxMetadataSize = 1 * 1024 * 1024
 const MaxBodySize = 10 * 1024 * 1024
 
 type Metadata struct {
-	ID       string      `json:"id"`
-	Type     string      `json:"type"`
-	Method   string      `json:"method"`
-	Path     string      `json:"path"`
-	RawQuery string      `json:"rawQuery,omitempty"`
-	StatusCode int `json:"statusCode,omitempty"`
-	Headers  http.Header `json:"headers"`
+	ID         string      `json:"id"`
+	ClientId   string      `json:"clientId,omitempty"`
+	ClientHost string      `json:"clientHost,omitempty"`
+	ClientPort string      `json:"clientPort,omitempty"`
+	Type       string      `json:"type"`
+	Method     string      `json:"method"`
+	Path       string      `json:"path"`
+	RawQuery   string      `json:"rawQuery,omitempty"`
+	StatusCode int         `json:"statusCode,omitempty"`
+	Headers    http.Header `json:"headers"`
 }
 
 /**
@@ -70,11 +73,13 @@ func WriteMessage(conn net.Conn, meta Metadata, body io.Reader, bodyLength uint3
 func ReadMessage(conn net.Conn) (Metadata, []byte, error) {
 	var length [4]byte
 	var meta Metadata
+	fmt.Println("Waiting for message header...")
 
 	if _, err := io.ReadFull(conn, length[:]); err != nil {
+		fmt.Println("Got New Request:")
 		return meta, nil, err
 	}
-
+	fmt.Println("Got New Request:")
 	metaLen := binary.BigEndian.Uint32(length[:])
 
 	if metaLen > MaxMetadataSize {
@@ -102,7 +107,7 @@ func ReadMessage(conn net.Conn) (Metadata, []byte, error) {
 
 	body := make([]byte, bodyLen)
 	_, err := io.ReadFull(conn, body)
-	
+
 	return meta, body, err
 }
 
