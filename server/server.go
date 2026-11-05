@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -13,7 +14,7 @@ import (
 )
 
 var (
-	tunnelConn  = make(map[string]net.Conn)
+	tunnelConn  = make(map[string]*TunnelConnection)
 	ClientHosts = map[string][]string{
 		"1": {"port-5000.dev.oshudstock.com", "port-4000.dev.oshudstock.com"},
 		"2": {"port-5147.dev.oshudstock.com", "port-7000.dev.oshudstock.com"},
@@ -64,10 +65,21 @@ func Start() {
 			continue
 		}
 		tunnelMu.Lock()
+
 		if meta.Type == "init" {
-			tunnelConn[meta.ClientId] = conn
+			tc := &TunnelConnection{
+				Conn:    conn,
+				Pending: make(map[string]chan Response),
+			}
+
+			tunnelConn[meta.ClientId] = tc
+
+			tunnelMu.Unlock()
+			go tc.ReadLoop(meta.ClientId)
+		} else {
+			tunnelMu.Unlock()
 		}
-		tunnelMu.Unlock()
+
 		fmt.Println("Tunnel client connected: ", meta.ClientId)
 	}
 
@@ -133,38 +145,67 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Client not establieshed connection", http.StatusBadGateway)
 		return
 	}
-	if err := protocol.WriteMessage(tunnelConnClient, meta, bytes.NewReader(body), uint32(len(body))); err != nil {
-		_ = tunnelConnClient.Close()
+	responseCh := make(chan Response, 1)
+	tunnelConnClient.PendingMu.Lock()
+	if tunnelConnClient.Closed {
+		tunnelConnClient.PendingMu.Unlock()
+		http.Error(w, "Tunnel Connection is closed", http.StatusBadGateway)
+		return
+	}
+	tunnelConnClient.Pending[meta.ID] = responseCh
+	tunnelConnClient.PendingMu.Unlock()
+	log.Printf("[REQUEST] Sending to client %s: %s", clientId, r.URL.Path)
+
+	tunnelConnClient.WriteMu.Lock()
+	err = protocol.WriteMessage(tunnelConnClient.Conn, meta, bytes.NewReader(body), uint32(len(body)))
+	tunnelConnClient.WriteMu.Unlock()
+
+	if err != nil {
+		tunnelConnClient.PendingMu.Lock()
+		delete(tunnelConnClient.Pending, meta.ID)
+		tunnelConnClient.PendingMu.Unlock()
+		log.Printf("[ERROR] Failed to send request: %v", err)
+		_ = tunnelConnClient.Conn.Close()
 		http.Error(w, "Failed to send request to tunnel", http.StatusBadGateway)
 		return
 	}
 
-	responseMeta, responseBody, err := protocol.ReadMessage(tunnelConnClient)
+	log.Printf("[REQUEST] Waiting for response: %s", r.URL.Path)
 
-	if err != nil {
-		_ = tunnelConnClient.Close()
+	response := <-responseCh
+
+	if response.Err != nil {
+		log.Printf("[ERROR] Failed to receive response: %v", response.Err)
 		http.Error(w, "Failed to receive tunnel response", http.StatusBadGateway)
 		return
 	}
 
-	if meta.ID != responseMeta.ID {
+	log.Printf("[RESPONSE] Received response for %s", r.URL.Path)
+
+	if meta.ID != response.Meta.ID {
+		log.Printf(
+			"[ERROR] Response ID mismatch: request=%s response=%s path=%s",
+			meta.ID,
+			response.Meta.ID,
+			r.URL.Path,
+		)
 		http.Error(w, "Tunnel response mismatch", http.StatusBadGateway)
 		return
 	}
 
-	for key, values := range responseMeta.Headers {
+	for key, values := range response.Meta.Headers {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
 
-	status := responseMeta.StatusCode
+	status := response.Meta.StatusCode
 
 	if status == 0 {
 		status = http.StatusBadGateway
 	}
 
 	w.WriteHeader(status)
-	_, _ = w.Write(responseBody)
+	_, _ = w.Write(response.Body)
 
 }

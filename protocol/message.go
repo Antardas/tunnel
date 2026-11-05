@@ -9,7 +9,6 @@ import (
 	"net/http"
 )
 
-const MaxMessageSize = 10 * 1024 * 1024
 const MaxMetadataSize = 1 * 1024 * 1024
 const MaxBodySize = 10 * 1024 * 1024
 
@@ -42,6 +41,7 @@ type Metadata struct {
 func WriteMessage(conn net.Conn, meta Metadata, body io.Reader, bodyLength uint32) error {
 
 	metadata, err := json.Marshal(meta)
+	fmt.Printf("Metadata after marshal: len: %d", len(metadata))
 	if err != nil {
 		return err
 	}
@@ -50,6 +50,15 @@ func WriteMessage(conn net.Conn, meta Metadata, body io.Reader, bodyLength uint3
 	}
 	var length [4]byte
 	binary.BigEndian.PutUint32(length[:], uint32(len(metadata)))
+
+	fmt.Printf(
+		"[PROTOCOL WRITE] conn=%p metadataLen=%d prefix=% x type=%s id=%s\n",
+		conn,
+		len(metadata),
+		length,
+		meta.Type,
+		meta.ID,
+	)
 
 	if err := writeAll(conn, length[:]); err != nil {
 		return err
@@ -76,11 +85,17 @@ func ReadMessage(conn net.Conn) (Metadata, []byte, error) {
 	fmt.Println("Waiting for message header...")
 
 	if _, err := io.ReadFull(conn, length[:]); err != nil {
-		fmt.Println("Got New Request:")
 		return meta, nil, err
 	}
 	fmt.Println("Got New Request:")
 	metaLen := binary.BigEndian.Uint32(length[:])
+
+	fmt.Printf(
+		"[PROTOCOL READ] conn=%p prefix=% x metadataLen=%d\n",
+		conn,
+		length,
+		metaLen,
+	)
 
 	if metaLen > MaxMetadataSize {
 		return meta, nil, fmt.Errorf("metadata too large")

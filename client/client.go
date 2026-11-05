@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -51,7 +52,13 @@ func connectOnce(clientId string) error {
 
 		meta, body, err := protocol.ReadMessage(conn)
 		if err != nil {
-			fmt.Println("Reading Request failed:", err)
+			if errors.Is(err, io.EOF) {
+				log.Println("Client disconnected")
+				return nil
+			}
+
+			fmt.Printf("reading request failed: %v\n", err)
+
 			continue
 		}
 
@@ -97,7 +104,15 @@ func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
 	body, err := io.ReadAll(resp.Body)
 
 	if err != nil {
-		return err
+		responseMeta := protocol.Metadata{
+			ID:         meta.ID,
+			ClientId:   activeClientId,
+			Type:       "response",
+			StatusCode: http.StatusBadGateway,
+			Headers:    make(http.Header),
+		}
+		body := []byte("Local service unavailable: " + err.Error())
+		return protocol.WriteMessage(conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
 	}
 
 	fmt.Printf("Status: %d\n", resp.StatusCode)
