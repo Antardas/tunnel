@@ -45,112 +45,87 @@ func connectOnce(clientId string) error {
 	fmt.Println("Connecting to the public server")
 
 	conn, err := net.DialTimeout("tcp", "tunnel.oshudstock.com:5135", 5*time.Second)
-	// conn, err := net.DialTimeout("tcp", "localhost:5135", 5*time.Second)
-
 	if err != nil {
 		return err
 	}
 
-	clientConn := &ClientConnection{
-		Conn: conn,
-	}
-
+	clientConn := &ClientConnection{Conn: conn}
 	defer conn.Close()
+
 	meta := protocol.Metadata{
 		ID:       uuid.NewString(),
 		ClientId: clientId,
 		Type:     "init",
-		Path:     "",
-		Method:   "",
 	}
-	protocol.WriteMessage(conn, meta, bytes.NewReader([]byte("")), 0)
-	fmt.Println("Conneted to the server")
+	if err := protocol.WriteMessage(conn, meta, bytes.NewReader(nil), 0); err != nil {
+		return fmt.Errorf("sending init message: %w", err)
+	}
+
+	fmt.Println("Connected to the server")
 	activeClientId = clientId
 
 	for {
-
+		readStarted := time.Now()
 		meta, body, err := protocol.ReadMessage(conn)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				log.Println("Client disconnected")
 				return nil
 			}
-
-			fmt.Printf("reading request failed: %v\n", err)
-
-			continue
+			return fmt.Errorf("reading request from server after %v: %w", time.Since(readStarted), err)
 		}
 
 		if meta.Type != "request" {
-			fmt.Println("Unexpected message type:", meta.Type)
+			log.Printf("[CLIENT] unexpected message type=%s id=%s", meta.Type, meta.ID)
 			continue
 		}
-		go func() {
-			if err := callService(clientConn, meta, body); err != nil {
-				fmt.Println("Reading Request failed:", err)
 
+		log.Printf("[CLIENT %s] TCP request received read_duration=%v body_bytes=%d method=%s path=%s", meta.ID, time.Since(readStarted), len(body), meta.Method, meta.Path)
+
+		go func(requestMeta protocol.Metadata, requestBody []byte) {
+			if err := callService(clientConn, requestMeta, requestBody); err != nil {
+				log.Printf("[CLIENT %s] request processing error=%v", requestMeta.ID, err)
 			}
-		}()
-
+		}(meta, body)
 	}
 }
 
 func callService(clinetConn *ClientConnection, meta protocol.Metadata, rawBody []byte) error {
 	started := time.Now()
-	// here this URL from server TCP metadata
+
 	if meta.ClientHost == "" {
 		return errors.New("clientHost is required")
 	}
 	if meta.ClientPort == "" {
 		return errors.New("clientPort is required")
 	}
+
 	path := fmt.Sprintf("http://localhost:%s", meta.ClientPort) + meta.Path
 	if meta.RawQuery != "" {
 		path += "?" + meta.RawQuery
 	}
-	fmt.Printf("Path: %s\n", path)
+
 	req, err := http.NewRequest(meta.Method, path, bytes.NewReader(rawBody))
 	if err != nil {
-		fmt.Println("Error happend during calling local service")
 		return err
 	}
 	req.Header = meta.Headers.Clone()
-	requestStarted := time.Now()
 
+	localRequestStarted := time.Now()
 	resp, err := localHTTPClient.Do(req)
-	fmt.Printf(
-		"[CLIENT] %s HTTP request: %v\n",
-		meta.Path,
-		time.Since(requestStarted),
-	)
+	log.Printf("[CLIENT %s] local HTTP round_trip=%v", meta.ID, time.Since(localRequestStarted))
 	if err != nil {
-		return err
+		return fmt.Errorf("local HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
-	bodyStarted := time.Now()
 
+	bodyStarted := time.Now()
 	body, err := io.ReadAll(resp.Body)
-	fmt.Printf(
-		"[CLIENT] %s Read body: %v\n",
-		meta.Path,
-		time.Since(bodyStarted),
-	)
+	log.Printf("[CLIENT %s] local response body read=%v bytes=%d", meta.ID, time.Since(bodyStarted), len(body))
 	if err != nil {
-		responseMeta := protocol.Metadata{
-			ID:         meta.ID,
-			ClientId:   activeClientId,
-			Type:       "response",
-			StatusCode: http.StatusBadGateway,
-			Headers:    make(http.Header),
-		}
-		body := []byte("Local service unavailable: " + err.Error())
-		clinetConn.WriteMu.Lock()
-		err = protocol.WriteMessage(clinetConn.Conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
-		clinetConn.WriteMu.Unlock()
+		return fmt.Errorf("reading local response body: %w", err)
 	}
 
-	fmt.Printf("Status: %d\n", resp.StatusCode)
-	fmt.Printf("Body: %d\n", len(body))
 	responseMeta := protocol.Metadata{
 		ID:         meta.ID,
 		ClientId:   activeClientId,
@@ -158,28 +133,16 @@ func callService(clinetConn *ClientConnection, meta protocol.Metadata, rawBody [
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header,
 	}
+
 	lockStarted := time.Now()
-
 	clinetConn.WriteMu.Lock()
-	fmt.Printf(
-		"[CLIENT] %s Write lock wait: %v\n",
-		meta.Path,
-		time.Since(lockStarted),
-	)
+	log.Printf("[CLIENT %s] TCP response write lock wait=%v", meta.ID, time.Since(lockStarted))
+
 	writeStarted := time.Now()
-
 	err = protocol.WriteMessage(clinetConn.Conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
-	fmt.Printf(
-		"[CLIENT] %s TCP write: %v\n",
-		meta.Path,
-		time.Since(writeStarted),
-	)
+	log.Printf("[CLIENT %s] TCP response write=%v bytes=%d err=%v", meta.ID, time.Since(writeStarted), len(body), err)
 	clinetConn.WriteMu.Unlock()
-	fmt.Printf(
-		"[CLIENT] %s Total: %v\n",
-		meta.Path,
-		time.Since(started),
-	)
 
+	log.Printf("[CLIENT %s] total processing=%v status=%d", meta.ID, time.Since(started), resp.StatusCode)
 	return err
 }

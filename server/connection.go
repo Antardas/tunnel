@@ -2,8 +2,10 @@ package server
 
 import (
 	"antardas/tcp-tunnel/protocol"
+	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type PendingRequest struct {
@@ -26,10 +28,10 @@ type TunnelConnection struct {
 
 func (tc *TunnelConnection) ReadLoop(clientID string) {
 	for {
-
+		readStarted := time.Now()
 		meta, body, err := protocol.ReadMessage(tc.Conn)
-
 		if err != nil {
+			log.Printf("[SERVER TCP] client=%s read error after=%v err=%v", clientID, time.Since(readStarted), err)
 			tc.FailAll(err)
 			tc.RemoveFromRegistry(clientID)
 			return
@@ -40,13 +42,14 @@ func (tc *TunnelConnection) ReadLoop(clientID string) {
 		delete(tc.Pending, meta.ID)
 		tc.PendingMu.Unlock()
 
+		log.Printf("[SERVER %s] TCP response received read_duration=%v body_bytes=%d status=%d matched=%t", meta.ID, time.Since(readStarted), len(body), meta.StatusCode, ch != nil)
+
 		if ch != nil {
 			ch <- Response{
 				Meta: meta,
 				Body: body,
 			}
 		}
-
 	}
 }
 

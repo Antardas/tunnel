@@ -100,18 +100,21 @@ func startHTTPServer() {
 }
 
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	requestID := uuid.NewString()
+	defer func() {
+		log.Printf("[SERVER %s] HTTP handler total=%v method=%s path=%s", requestID, time.Since(started), r.Method, r.URL.Path)
+	}()
+
 	host := r.Host
-	fmt.Println("Received: ", r.Method, r.URL.Path, r.URL.Port())
-
 	hostname, _, err := net.SplitHostPort(host)
-
 	if err == nil {
 		host = hostname
 	}
 
 	clientId, ok := HostClient[host]
 	if !ok {
-		http.Error(w, "Unknowd host", http.StatusNotFound)
+		http.Error(w, "Unknown host", http.StatusNotFound)
 		return
 	}
 
@@ -121,19 +124,16 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Host: ", host)
-	fmt.Println("Client ID: ", clientId)
-	fmt.Println("Local Port", hostPort)
-
+	bodyStarted := time.Now()
 	body, err := io.ReadAll(r.Body)
-
+	log.Printf("[SERVER %s] request body read=%v bytes=%d", requestID, time.Since(bodyStarted), len(body))
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
 
 	meta := protocol.Metadata{
-		ID:         uuid.NewString(),
+		ID:         requestID,
 		Type:       "request",
 		ClientHost: host,
 		ClientPort: hostPort,
@@ -142,58 +142,55 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		RawQuery:   r.URL.RawQuery,
 		Headers:    r.Header,
 	}
+
 	tunnelMu.Lock()
 	tunnelConnClient, ok := tunnelConn[clientId]
 	tunnelMu.Unlock()
 	if !ok {
-		http.Error(w, "Client not establieshed connection", http.StatusBadGateway)
+		http.Error(w, "Client has not established a connection", http.StatusBadGateway)
 		return
 	}
+
 	responseCh := make(chan Response, 1)
 	tunnelConnClient.PendingMu.Lock()
 	if tunnelConnClient.Closed {
 		tunnelConnClient.PendingMu.Unlock()
-		http.Error(w, "Tunnel Connection is closed", http.StatusBadGateway)
+		http.Error(w, "Tunnel connection is closed", http.StatusBadGateway)
 		return
 	}
 	tunnelConnClient.Pending[meta.ID] = responseCh
 	tunnelConnClient.PendingMu.Unlock()
-	log.Printf("[REQUEST] Sending to client %s: %s", clientId, r.URL.Path)
-	writeStart := time.Now()
+
+	lockStarted := time.Now()
 	tunnelConnClient.WriteMu.Lock()
-	log.Printf("Write lock wait: %v\n", time.Since(writeStart))
+	log.Printf("[SERVER %s] TCP write lock wait=%v", requestID, time.Since(lockStarted))
+	writeStarted := time.Now()
 	err = protocol.WriteMessage(tunnelConnClient.Conn, meta, bytes.NewReader(body), uint32(len(body)))
+	log.Printf("[SERVER %s] TCP request write=%v bytes=%d", requestID, time.Since(writeStarted), len(body))
 	tunnelConnClient.WriteMu.Unlock()
 
 	if err != nil {
 		tunnelConnClient.PendingMu.Lock()
 		delete(tunnelConnClient.Pending, meta.ID)
 		tunnelConnClient.PendingMu.Unlock()
-		log.Printf("[ERROR] Failed to send request: %v", err)
+		log.Printf("[SERVER %s] request write error=%v", requestID, err)
 		_ = tunnelConnClient.Conn.Close()
 		http.Error(w, "Failed to send request to tunnel", http.StatusBadGateway)
 		return
 	}
 
-	log.Printf("[REQUEST] Waiting for response: %s", r.URL.Path)
-	responseStart := time.Now()
+	responseStarted := time.Now()
+	log.Printf("[SERVER %s] waiting for client response", requestID)
 	response := <-responseCh
-	log.Printf("Response wait: %v", time.Since(responseStart))
+	log.Printf("[SERVER %s] response wait=%v", requestID, time.Since(responseStarted))
 	if response.Err != nil {
-		log.Printf("[ERROR] Failed to receive response: %v", response.Err)
+		log.Printf("[SERVER %s] response error=%v", requestID, response.Err)
 		http.Error(w, "Failed to receive tunnel response", http.StatusBadGateway)
 		return
 	}
 
-	log.Printf("[RESPONSE] Received response for %s", r.URL.Path)
-
 	if meta.ID != response.Meta.ID {
-		log.Printf(
-			"[ERROR] Response ID mismatch: request=%s response=%s path=%s",
-			meta.ID,
-			response.Meta.ID,
-			r.URL.Path,
-		)
+		log.Printf("[SERVER %s] response ID mismatch got=%s", requestID, response.Meta.ID)
 		http.Error(w, "Tunnel response mismatch", http.StatusBadGateway)
 		return
 	}
@@ -205,12 +202,12 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := response.Meta.StatusCode
-
 	if status == 0 {
 		status = http.StatusBadGateway
 	}
 
 	w.WriteHeader(status)
-	_, _ = w.Write(response.Body)
-
+	responseWriteStarted := time.Now()
+	_, err = w.Write(response.Body)
+	log.Printf("[SERVER %s] HTTP response write=%v bytes=%d status=%d err=%v", requestID, time.Since(responseWriteStarted), len(response.Body), status, err)
 }
