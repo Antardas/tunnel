@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,12 +19,14 @@ var (
 	ClientHosts = map[string][]string{
 		"1": {"port-5000.dev.oshudstock.com", "port-4000.dev.oshudstock.com"},
 		"2": {"port-5147.dev.oshudstock.com", "port-7000.dev.oshudstock.com"},
+		"3": {"test.localhost"},
 	}
 	HostClient = map[string]string{
 		"port-5000.dev.oshudstock.com": "1",
 		"port-4000.dev.oshudstock.com": "1",
 		"port-5147.dev.oshudstock.com": "2",
 		"port-7000.dev.oshudstock.com": "2",
+		"test.localhost":               "3",
 	}
 
 	HostPort = map[string]string{
@@ -31,6 +34,7 @@ var (
 		"port-4000.dev.oshudstock.com": "4000",
 		"port-5147.dev.oshudstock.com": "5147",
 		"port-7000.dev.oshudstock.com": "7000",
+		"test.localhost":               "5147",
 	}
 	tunnelMu sync.Mutex
 )
@@ -155,8 +159,9 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	tunnelConnClient.Pending[meta.ID] = responseCh
 	tunnelConnClient.PendingMu.Unlock()
 	log.Printf("[REQUEST] Sending to client %s: %s", clientId, r.URL.Path)
-
+	writeStart := time.Now()
 	tunnelConnClient.WriteMu.Lock()
+	log.Printf("Write lock wait: %v\n", time.Since(writeStart))
 	err = protocol.WriteMessage(tunnelConnClient.Conn, meta, bytes.NewReader(body), uint32(len(body)))
 	tunnelConnClient.WriteMu.Unlock()
 
@@ -171,9 +176,9 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[REQUEST] Waiting for response: %s", r.URL.Path)
-
+	responseStart := time.Now()
 	response := <-responseCh
-
+	log.Printf("Response wait: %v", time.Since(responseStart))
 	if response.Err != nil {
 		log.Printf("[ERROR] Failed to receive response: %v", response.Err)
 		http.Error(w, "Failed to receive tunnel response", http.StatusBadGateway)

@@ -9,14 +9,28 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
+type ClientConnection struct {
+	Conn    net.Conn
+	WriteMu sync.Mutex
+}
+
 var activeClientId string
+var localTransport = http.DefaultTransport.(*http.Transport).Clone()
+
+var localHTTPClient = &http.Client{
+	Transport: localTransport,
+}
 
 func Connect(clientId string) {
+	// localTransport.MaxIdleConns = 100
+	// localTransport.MaxIdleConnsPerHost = 100
+	// localTransport.IdleConnTimeout = 90 * time.Second
 	for {
 		err := connectOnce(clientId)
 		if err != nil {
@@ -31,9 +45,14 @@ func connectOnce(clientId string) error {
 	fmt.Println("Connecting to the public server")
 
 	conn, err := net.DialTimeout("tcp", "tunnel.oshudstock.com:5135", 5*time.Second)
+	// conn, err := net.DialTimeout("tcp", "localhost:5135", 5*time.Second)
 
 	if err != nil {
 		return err
+	}
+
+	clientConn := &ClientConnection{
+		Conn: conn,
 	}
 
 	defer conn.Close()
@@ -66,16 +85,18 @@ func connectOnce(clientId string) error {
 			fmt.Println("Unexpected message type:", meta.Type)
 			continue
 		}
+		go func() {
+			if err := callService(clientConn, meta, body); err != nil {
+				fmt.Println("Reading Request failed:", err)
 
-		if err := callService(conn, meta, body); err != nil {
-			fmt.Println("Reading Request failed:", err)
-			continue
-		}
+			}
+		}()
 
 	}
 }
 
-func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
+func callService(clinetConn *ClientConnection, meta protocol.Metadata, rawBody []byte) error {
+	started := time.Now()
 	// here this URL from server TCP metadata
 	if meta.ClientHost == "" {
 		return errors.New("clientHost is required")
@@ -94,15 +115,26 @@ func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
 		return err
 	}
 	req.Header = meta.Headers.Clone()
-	client := &http.Client{}
+	requestStarted := time.Now()
 
-	resp, err := client.Do(req)
+	resp, err := localHTTPClient.Do(req)
+	fmt.Printf(
+		"[CLIENT] %s HTTP request: %v\n",
+		meta.Path,
+		time.Since(requestStarted),
+	)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	bodyStarted := time.Now()
 
+	body, err := io.ReadAll(resp.Body)
+	fmt.Printf(
+		"[CLIENT] %s Read body: %v\n",
+		meta.Path,
+		time.Since(bodyStarted),
+	)
 	if err != nil {
 		responseMeta := protocol.Metadata{
 			ID:         meta.ID,
@@ -112,7 +144,9 @@ func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
 			Headers:    make(http.Header),
 		}
 		body := []byte("Local service unavailable: " + err.Error())
-		return protocol.WriteMessage(conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
+		clinetConn.WriteMu.Lock()
+		err = protocol.WriteMessage(clinetConn.Conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
+		clinetConn.WriteMu.Unlock()
 	}
 
 	fmt.Printf("Status: %d\n", resp.StatusCode)
@@ -124,6 +158,28 @@ func callService(conn net.Conn, meta protocol.Metadata, rawBody []byte) error {
 		StatusCode: resp.StatusCode,
 		Headers:    resp.Header,
 	}
+	lockStarted := time.Now()
 
-	return protocol.WriteMessage(conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
+	clinetConn.WriteMu.Lock()
+	fmt.Printf(
+		"[CLIENT] %s Write lock wait: %v\n",
+		meta.Path,
+		time.Since(lockStarted),
+	)
+	writeStarted := time.Now()
+
+	err = protocol.WriteMessage(clinetConn.Conn, responseMeta, bytes.NewReader(body), uint32(len(body)))
+	fmt.Printf(
+		"[CLIENT] %s TCP write: %v\n",
+		meta.Path,
+		time.Since(writeStarted),
+	)
+	clinetConn.WriteMu.Unlock()
+	fmt.Printf(
+		"[CLIENT] %s Total: %v\n",
+		meta.Path,
+		time.Since(started),
+	)
+
+	return err
 }
